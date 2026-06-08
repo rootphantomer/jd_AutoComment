@@ -131,6 +131,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# WorkBuddy
+.workbuddy/
+
 # user config
 config.user.yml
 config.yml

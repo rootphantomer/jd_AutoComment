@@ -356,17 +356,20 @@ def all_evaluate(opts: dict | None = None) -> dict[str, int]:
 
 
 def delete_jpg() -> None:
-    """删除当前目录下的所有jpg图片"""
+    """删除当前目录及img子目录下的所有jpg图片"""
     current_directory = os.getcwd()
-    try:
-        files = os.listdir(current_directory)
-        for file in files:
-            if file.lower().endswith(".jpg"):
-                file_path = os.path.join(current_directory, file)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-    except OSError as e:
-        print(f"Error deleting jpg files: {e}")
+    for directory in [current_directory, os.path.join(current_directory, "img")]:
+        try:
+            if not os.path.isdir(directory):
+                continue
+            files = os.listdir(directory)
+            for file in files:
+                if file.lower().endswith(".jpg"):
+                    file_path = os.path.join(directory, file)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+        except OSError as e:
+            print(f"Error deleting jpg files in {directory}: {e}")
 
 
 # 普通评价
@@ -529,47 +532,55 @@ def ordinary(N: dict[str, int], opts: dict | None = None) -> dict[str, int]:
                     imgCommentCount_bool = False
                     imgurl = ""
                 elif imgdata["imgComments"]["imgCommentCount"] > 0:
-                    imgurl1 = imgdata["imgComments"]["imgList"][0]["imageUrl"]
-                    imgurl2 = imgdata["imgComments"]["imgList"][1]["imageUrl"]
-                    
+                    imgList = imgdata["imgComments"]["imgList"]
+                    # 初始化上传后的URL变量（Bug 3修复）
+                    imgurl1t = ""
+                    imgurl2t = ""
+
+                    # 根据实际图片数量安全获取源URL（Bug 2修复）
+                    imgurl1 = imgList[0]["imageUrl"] if len(imgList) >= 1 else ""
+                    imgurl2 = imgList[1]["imageUrl"] if len(imgList) >= 2 else ""
+
                     if logger:
                         logger.info("imgurl1 url: %s", imgurl1)
                         logger.info("imgurl2 url: %s", imgurl2)
-                    
+
                     session = requests.Session()
                     imgBasic = "//img20.360buyimg.com/shaidan/s645x515_"
-                    
+
                     # 下载并上传第一张图片
-                    imgName1 = generate_unique_filename()
-                    if logger:
-                        logger.debug(f"Image :{imgName1}")
-                    
-                    downloaded_file1 = download_image(imgurl1, imgName1)
-                    if downloaded_file1:
-                        imgPart1 = upload_image(imgName1, downloaded_file1, session, headers)
-                        if imgPart1 and imgPart1.status_code == 200 and ".jpg" in imgPart1.text:
-                            imgurl1t = f"{imgBasic}{imgPart1.text}"
-                        else:
-                            if logger:
-                                logger.info("上传图片1失败")
-                            imgurl1 = ""
-                    
+                    if imgurl1:
+                        imgName1 = generate_unique_filename()
+                        if logger:
+                            logger.debug(f"Image :{imgName1}")
+
+                        downloaded_file1 = download_image(imgurl1, imgName1)
+                        if downloaded_file1:
+                            imgPart1 = upload_image(imgName1, downloaded_file1, session, headers)
+                            if imgPart1 and imgPart1.status_code == 200 and ".jpg" in imgPart1.text:
+                                imgurl1t = f"{imgBasic}{imgPart1.text}"
+                            else:
+                                if logger:
+                                    logger.info("上传图片1失败")
+
                     # 下载并上传第二张图片
-                    imgName2 = generate_unique_filename()
-                    if logger:
-                        logger.debug(f"Image :{imgName2}")
-                    
-                    downloaded_file2 = download_image(imgurl2, imgName2)
-                    if downloaded_file2:
-                        imgPart2 = upload_image(imgName2, downloaded_file2, session, headers)
-                        if imgPart2 and imgPart2.status_code == 200 and ".jpg" in imgPart2.text:
-                            imgurl2t = f"{imgBasic}{imgPart2.text}"
-                        else:
-                            if logger:
-                                logger.info("上传图片2失败")
-                            imgurl2 = ""
-                    
-                    imgurl = f"{imgurl1},{imgurl2}"
+                    if imgurl2:
+                        imgName2 = generate_unique_filename()
+                        if logger:
+                            logger.debug(f"Image :{imgName2}")
+
+                        downloaded_file2 = download_image(imgurl2, imgName2)
+                        if downloaded_file2:
+                            imgPart2 = upload_image(imgName2, downloaded_file2, session, headers)
+                            if imgPart2 and imgPart2.status_code == 200 and ".jpg" in imgPart2.text:
+                                imgurl2t = f"{imgBasic}{imgPart2.text}"
+                            else:
+                                if logger:
+                                    logger.info("上传图片2失败")
+
+                    # 使用上传后的URL拼接imgurl，排除上传失败的图片（Bug 1修复）
+                    uploaded_urls = [u for u in [imgurl1t, imgurl2t] if u]
+                    imgurl = ",".join(uploaded_urls)
                     if logger:
                         logger.debug("Image URL: %s", imgurl)
                         logger.info(f"\t\t图片url={imgurl}")
@@ -1122,13 +1133,51 @@ def main(opts: dict | None = None) -> None:
     if logger:
         logger.info("全部完成啦！")
     
-    # 检查是否有未完成的评价，递归重试
-    for key in N:
-        if N[key] != 0:
-            if logger:
-                logger.warning("出现了二次错误，跳过了部分，重新尝试")
-            main(opts)
+    # 检查是否有未完成的评价，循环重试（Bug 5修复：递归改为while循环，最多3次）
+    max_retries = 3
+    for retry in range(max_retries):
+        has_pending = False
+        for key in N:
+            if N[key] != 0:
+                has_pending = True
+                break
+        if not has_pending:
             break
+        if logger:
+            logger.warning("出现了二次错误，跳过了部分，重新尝试（第%d次）", retry + 1)
+
+        # 普通评价
+        if N.get("待评价订单", 0) != 0:
+            if logger:
+                logger.info("1.开始普通评价")
+            N = ordinary(N, opts)
+            if logger:
+                logger.debug("N value after executing ordinary(): %s", N)
+            N = No(opts)
+            if logger:
+                logger.debug("N value after executing No(): %s", N)
+
+        # 追评
+        if N.get("待追评", 0) != 0:
+            if logger:
+                logger.info("3.开始批量追评,注意：追评不会自动上传图片")
+            N = review(N, opts)
+            if logger:
+                logger.debug("N value after executing review(): %s", N)
+            N = No(opts)
+            if logger:
+                logger.debug("N value after executing No(): %s", N)
+
+        # 服务评价
+        if N.get("服务评价", 0) != 0:
+            if logger:
+                logger.info("4.开始服务评价")
+            N = Service_rating(N, opts)
+            if logger:
+                logger.debug("N value after executing Service_rating(): %s", N)
+            N = No(opts)
+            if logger:
+                logger.debug("N value after executing No(): %s", N)
 
 
 if __name__ == "__main__":
