@@ -13,6 +13,37 @@
 
 由爬虫先行对商品的既有评价进行爬取，在此基础上进行自己的评价
 
+## 项目结构
+
+```
+jd_AutoComment/
+├── auto_comment_plus.py   # CLI 入口 & 主流程编排
+├── config.py              # 常量定义 + 配置文件读取 + Headers 构建
+├── logger.py              # 日志初始化 & ANSI 样式格式化
+├── templates.py           # 评论文本模板（DEFAULT_COMMENTS / GIFT_COMMENTS）
+├── image_utils.py         # 图片下载 / 上传 / 清理
+├── comment_generator.py   # 评论生成（generation）
+├── evaluator.py           # 评价统计（get_evaluation_stats / all_evaluate）
+├── handlers.py            # 三大评价处理器（ordinary / review / service_rating）
+├── jdspider.py            # 京东商品评论爬虫
+├── config.yml             # 默认配置文件
+└── requirements.txt       # Python 依赖
+```
+
+### 模块依赖关系
+
+```
+config ────── (无项目内依赖)
+logger ────── (无项目内依赖)
+templates ─── (无项目内依赖)
+image_utils ─ (无项目内依赖)
+jdspider ────→ templates
+comment_generator → jdspider, templates
+evaluator ─── (无项目内依赖)
+handlers ────→ comment_generator, config, image_utils
+auto_comment_plus → config, evaluator, handlers, logger, jdspider
+```
+
 ## 用法
 
 > 请先确保python版本为3.9+，最好是python3.10+。
@@ -26,13 +57,6 @@ stable分支为稳定版，更新较慢，基本可以稳定使用，但功能�
 more_cookie分支是有需要多账号进行批量评论诞生的分支。
 > 由于作者只有一个 jd 账号，因此该more_cookie分支，需要有多账号的朋友进行测试。
 目前代码逻辑是 先普通评价-》再追评-》再第二个账号继续执行前面的顺序。所以你多账号可能要历史追评结束后才会执行，cookie 可能会失效，如果很多个 jd 账号话。可能实际上效果没那么好。
-
-### 安装依赖库
-
-```bash
-pip install -r requirements.
-
-请用户自行判断使用哪个分支。
 
 ### 快速使用
 
@@ -73,15 +97,14 @@ python3 auto_comment_plus.py
 本程序支持命令行参数：
 
 ```text
-usage: auto_comment_plus.py [-h] [--dry-run] [--log-level LOG_LEVEL] [-o LOG_FILE]
+usage: auto_comment_plus.py [-h] [--dry-run] [-lv LOG_LEVEL] [-o LOG_FILE]
 
 optional arguments:
   -h, --help            show this help message and exit
-  --dry-run             have a full run without comment submission
-  --log-level LOG_LEVEL
-                        specify logging level (default: info)
-  -o LOG_FILE, --log-file LOG_FILE
-                        specify logging file
+  --dry-run             完整运行但不提交评价（测试模式）
+  -lv, --log-level      指定日志级别 (默认: DEBUG)
+                        可选: DEBUG, INFO, WARN, ERROR, FATAL
+  -o, --log-file        指定日志文件路径（默认使用日期命名）
 ```
 
 **`-h`, `--help`:**
@@ -90,17 +113,29 @@ optional arguments:
 
 **`--dry-run`:**
 
-完整地运行程序，但不实际提交评论。
+完整地运行程序，但不实际提交评论。适合首次使用时验证流程是否正常。
 
-**`--log-level LOG_LEVEL`:**
+**`-lv`, `--log-level`:**
 
-设置输出日志的等级。默认为 `INFO` 。可选等级为 `DEBUG`、`INFO`、`WARNING`、`ERROR` ，输出内容量依次递减。
+设置输出日志的等级。默认为 `DEBUG`。可选等级为 `DEBUG`、`INFO`、`WARN`、`ERROR`、`FATAL`，输出内容量依次递减。
 
-**注意:** 若你需要提交 issue 来报告一个 bug ，请将该选项设置为 `DEBUG` 。
+**注意:** 若你需要提交 issue 来报告一个 bug ，请将该选项设置为 `DEBUG`。
 
-**`-o LOG_FILE`:**
+**`-o`, `--log-file`:**
 
 设置输出日志文件的路径。若无此选项，则不输出到文件。
+
+### 功能说明
+
+| 功能 | 说明 |
+|------|------|
+| 普通评价 | 自动评价待评价订单，支持晒图 |
+| 追评 | 对已评价订单进行追评，不支持晒图 |
+| 服务评价 | 自动进行服务评分（随机 4-5 分） |
+| 重试机制 | 若存在未完成评价，自动重试（最多 3 次） |
+| dry-run 模式 | 完整运行流程但不提交，用于测试验证 |
+
+执行顺序：**普通评价 → 追评 → 服务评价**，若仍有未完成项则循环重试。
 
 ## 声明
 
