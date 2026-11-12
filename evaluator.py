@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import requests
@@ -56,18 +57,19 @@ def all_evaluate(
             logger.debug("Total loop times: %d", len(evaluate_data))
 
         for ev in evaluate_data:
-            na = ev.xpath("a/text()")[0]
+            names = ev.xpath("a/text()")
+            if not names or not names[0].strip():
+                continue
+            na = names[0].strip()
             if logger:
                 logger.debug("na: %s", na)
-            try:
-                num = ev.xpath("b/text()")[0]
-                if logger:
-                    logger.debug("num: %s", num)
-            except IndexError:
-                if logger:
-                    logger.info("Can't find num content in XPath, fallback to 0")
-                num = 0
-            n[na] = int(num)
+
+            numbers = ev.xpath("b/text()")
+            raw_num = numbers[0] if numbers else "0"
+            match = re.search(r"\d+", raw_num)
+            n[na] = int(match.group()) if match else 0
+            if logger:
+                logger.debug("num: %s", n[na])
     except Exception as e:
         if logger:
             logger.error("Error parsing evaluate data: %s", e)

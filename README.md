@@ -98,6 +98,7 @@ python3 auto_comment_plus.py
 
 ```text
 usage: auto_comment_plus.py [-h] [--dry-run] [-lv LOG_LEVEL] [-o LOG_FILE]
+                            [--no-log-file]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -105,6 +106,7 @@ optional arguments:
   -lv, --log-level      指定日志级别 (默认: DEBUG)
                         可选: DEBUG, INFO, WARN, ERROR, FATAL
   -o, --log-file        指定日志文件路径（默认使用日期命名）
+  --no-log-file         不写入日志文件，仅输出到控制台
 ```
 
 **`-h`, `--help`:**
@@ -123,7 +125,11 @@ optional arguments:
 
 **`-o`, `--log-file`:**
 
-设置输出日志文件的路径。若无此选项，则不输出到文件。
+设置输出日志文件的路径。默认写入 `log/日期.txt`。
+
+**`--no-log-file`:**
+
+不创建日志文件，只输出到控制台。
 
 ### 功能说明
 

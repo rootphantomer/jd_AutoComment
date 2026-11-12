@@ -10,7 +10,6 @@ import copy
 import logging
 import os
 import time
-from typing import Any
 
 # ---------------------------------------------------------------------------
 # ANSI 样式常量
@@ -121,7 +120,20 @@ def _normalize_log_level(log_level: str) -> int:
     return getattr(logging, level_str, logging.INFO)
 
 
-def setup_logging(log_level: str, log_file: str | None = None) -> logging.Logger:
+def _clear_handlers(logger: logging.Logger) -> None:
+    """移除并关闭日志器上已有的处理器，避免重复初始化时重复输出。"""
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
+def setup_logging(
+    log_level: str,
+    log_file: str | bool | None = None,
+) -> logging.Logger:
     """统一设置日志系统。
 
     创建主日志器 ``"comment"``，同时为 ``jieba`` 和 ``spider`` 子系统
@@ -137,8 +149,9 @@ def setup_logging(log_level: str, log_file: str | None = None) -> logging.Logger
     """
     level = _normalize_log_level(log_level)
 
-    # 主日志器
+    # 主日志器（重复调用时先清理旧处理器，避免日志重复输出）
     logger = logging.getLogger("comment")
+    _clear_handlers(logger)
     logger.setLevel(level)
 
     # 格式化器
@@ -175,11 +188,13 @@ def setup_logging(log_level: str, log_file: str | None = None) -> logging.Logger
 
     # 配置 jieba 和 spider 日志器
     jieba_logger = logging.getLogger("jieba")
+    _clear_handlers(jieba_logger)
     jieba_logger.setLevel(level)
     for h in list(logger.handlers):
         jieba_logger.addHandler(h)
 
     spider_logger = logging.getLogger("spider")
+    _clear_handlers(spider_logger)
     spider_logger.setLevel(level)
     for h in list(logger.handlers):
         spider_logger.addHandler(h)

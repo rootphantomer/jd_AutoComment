@@ -6,13 +6,10 @@ import json
 import logging
 import random
 import re
-import sys
 import time
-from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import requests
-import yaml
 import zhon.hanzi
 from lxml import etree
 
@@ -22,13 +19,13 @@ from templates import DEFAULT_COMMENTS
 default_logger = logging.getLogger("jdspider")
 
 # Cookie（由外部设置）
-cookie: bytes = b""
+cookie: str = ""
 
 # 定义基础请求头，避免重复代码
 BASE_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,"
     "*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-    "accept-encoding": "gzip, deflate, br",
+    "accept-encoding": "gzip, deflate",
     "accept-language": "zh-CN,zh;q=0.9",
     "cache-control": "max-age=0",
     "dnt": "1",
@@ -70,8 +67,6 @@ class JDSpider:
         self.start_url = f"https://search.jd.com/Search?keyword={quote(category)}&enc=utf-8"
         # 评论接口的基础 URL
         self.comment_base_url = "https://club.jd.com"
-        # 基础请求头
-        self.headers = BASE_HEADERS.copy()
         # 带 cookie 的请求头
         self.headers_with_cookie = {
             **BASE_HEADERS,
@@ -92,20 +87,26 @@ class JDSpider:
         # 获取商品 ID 列表
         self.product_ids = self._get_product_ids()
 
-    def _build_comment_url(self, product_id: str, page: int, score: int) -> str:
+    def _build_comment_url(self, product_id: str, page: int) -> str:
         """
         构建评论接口的完整 URL
         
         Args:
             product_id: 商品 ID
             page: 评论页码
-            score: 评论类型（1 差评，2 中评，3 好评）
-            
         Returns:
             完整的评论接口 URL
         """
-        path = f"/discussion/getProductPageImageCommentList.action?productId={product_id}"
-        url = self.comment_base_url + path
+        params = {
+            "productId": product_id,
+            "isShadowSku": "0",
+            "page": page,
+            "pageSize": 10,
+        }
+        url = (
+            f"{self.comment_base_url}/discussion/getProductPageImageCommentList.action"
+            f"?{urlencode(params)}"
+        )
         
         if default_logger:
             default_logger.debug("评论接口 URL: %s", url)
@@ -185,7 +186,8 @@ class JDSpider:
         if score not in self.comment_types:
             raise ValueError(f"无效的评论类型: {score}，必须是 1(差评)、2(中评) 或 3(好评)")
         
-        comments = []
+        comments: list[str] = []
+        seen_comments: set[str] = set()
         
         if default_logger:
             default_logger.info(
@@ -219,7 +221,7 @@ class JDSpider:
                 if default_logger:
                     default_logger.debug("正在爬取第 %d 页评论", page)
                 
-                url = self._build_comment_url(product_id, page, score)
+                url = self._build_comment_url(product_id, page)
                 headers = self._get_request_headers(product_id)
 
                 try:
@@ -253,8 +255,11 @@ class JDSpider:
                     continue
 
                 # 检查是否有评论数据
-                img_comments = res_json.get("imgComments", {})
-                comment_count = img_comments.get("imgCommentCount", 0)
+                img_comments = res_json.get("imgComments") or {}
+                try:
+                    comment_count = int(img_comments.get("imgCommentCount") or 0)
+                except (TypeError, ValueError):
+                    comment_count = 0
                 
                 if comment_count == 0:
                     if default_logger:
@@ -262,17 +267,29 @@ class JDSpider:
                     break
 
                 # 提取评论内容
-                img_list = img_comments.get("imgList", [])
+                img_list = img_comments.get("imgList") or []
+                new_count = 0
                 for comment_data in img_list:
                     try:
                         comment_vo = comment_data.get("commentVo", {})
-                        content = comment_vo.get("content", "").replace("\n", " ").replace("\r", " ")
-                        if content:
+                        content = " ".join(comment_vo.get("content", "").split())
+                        if content and content not in seen_comments:
+                            seen_comments.add(content)
                             comments.append(content)
+                            new_count += 1
                     except (KeyError, AttributeError) as e:
                         if default_logger:
                             default_logger.debug("提取评论失败: %s", e)
                         continue
+
+                if new_count == 0:
+                    if default_logger:
+                        default_logger.debug(
+                            "本页无新增评论，停止翻页 (商品%s, 第%d页)",
+                            product_id,
+                            page,
+                        )
+                    break
 
         if default_logger:
             default_logger.info("共爬取 %d 条%s评价", len(comments), self.comment_types[score])

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -16,10 +17,12 @@ import yaml
 # 常量
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH: str = "./config.yml"
+BASE_DIR: Path = Path(__file__).resolve().parent
+
+CONFIG_PATH: str = str(BASE_DIR / "config.yml")
 """默认配置文件路径"""
 
-USER_CONFIG_PATH: str = "./config.user.yml"
+USER_CONFIG_PATH: str = str(BASE_DIR / "config.user.yml")
 """用户自定义配置文件路径（优先于默认配置）"""
 
 ORDINARY_SLEEP_SEC: int = 10
@@ -50,14 +53,25 @@ def load_config() -> dict[str, Any]:
     Raises:
         FileNotFoundError: 配置文件不存在时。
         yaml.YAMLError: 配置文件格式错误时。
+        ValueError: 配置内容缺少 ``user.cookie`` 或结构不正确时。
     """
-    if os.path.exists(USER_CONFIG_PATH):
-        cfg_path = USER_CONFIG_PATH
-    else:
-        cfg_path = CONFIG_PATH
+    cfg_path = USER_CONFIG_PATH if os.path.exists(USER_CONFIG_PATH) else CONFIG_PATH
 
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"配置文件不存在: {cfg_path}") from exc
+    except yaml.YAMLError as exc:
+        raise yaml.YAMLError(f"配置文件格式错误: {cfg_path}: {exc}") from exc
+
+    if not isinstance(cfg, dict):
+        raise ValueError(f"配置文件格式错误，顶层必须是映射: {cfg_path}")
+
+    user = cfg.get("user")
+    cookie = user.get("cookie") if isinstance(user, dict) else None
+    if not isinstance(cookie, str) or not cookie.strip():
+        raise ValueError(f"配置文件缺少有效的 user.cookie: {cfg_path}")
 
     return cfg
 
@@ -77,10 +91,8 @@ def build_headers(cookie: str) -> tuple[dict[str, Any], dict[str, Any]]:
         - headers: 精简请求头，用于普通 GET 请求。
         - headers2: 完整请求头，用于 POST 提交评价等操作。
     """
-    ck = cookie.encode("utf-8")
-
     headers2: dict[str, Any] = {
-        "Cookie": ck,
+        "Cookie": cookie,
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/114.0.5735.110 Safari/537.36"
@@ -104,7 +116,7 @@ def build_headers(cookie: str) -> tuple[dict[str, Any], dict[str, Any]]:
     }
 
     headers: dict[str, Any] = {
-        "Cookie": ck,
+        "Cookie": cookie,
         "User-Agent": (
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
             '(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0 '

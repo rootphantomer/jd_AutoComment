@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import random
 import time
-import urllib.parse
 from typing import Any
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import requests
 from lxml import etree
@@ -18,6 +18,151 @@ from lxml import etree
 from comment_generator import generation
 from config import ORDINARY_SLEEP_SEC, REVIEW_SLEEP_SEC, SERVICE_RATING_SLEEP_SEC
 from image_utils import generate_unique_filename, download_image, upload_image
+
+ORDER_URL = "https://club.jd.com/myJdcomments/myJdcomment.action"
+SAVE_COMMENT_URL = "https://club.jd.com/myJdcomments/saveProductComment.action"
+SAVE_REVIEW_URL = "https://club.jd.com/afterComments/saveAfterCommentAndShowOrder.action"
+SURVEY_URL = "https://club.jd.com/myJdcomments/insertRestSurvey.action"
+IMAGE_LIST_URL = "https://club.jd.com/discussion/getProductPageImageCommentList.action"
+UPLOADED_IMAGE_BASE = "//img20.360buyimg.com/shaidan/s645x515_"
+
+
+def _fetch_order_rows(
+    sort: int,
+    pending: int,
+    headers: dict[str, Any],
+    opts: dict[str, Any],
+    primary_xpath: str,
+    fallback_xpath: str,
+    label: str,
+) -> list[Any]:
+    """分页抓取订单列表，并按主/备用 XPath 提取订单节点。"""
+    logger = opts.get("logger")
+    pages: list[Any] = []
+    page_count = pending // 20 + 1
+
+    if logger:
+        logger.debug("Fetching %s pages, total loop times: %d", label, page_count)
+
+    for page in range(1, page_count + 1):
+        url = f"{ORDER_URL}?sort={sort}&page={page}"
+        if logger:
+            logger.debug("URL: %s", url)
+
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            if logger:
+                logger.warning("Failed to fetch %s page %d: %s", label, page, exc)
+            continue
+
+        pages.append(etree.HTML(response.text))
+
+    def collect(xpath: str) -> list[Any]:
+        rows: list[Any] = []
+        for html_tree in pages:
+            rows.extend(html_tree.xpath(xpath))
+        return rows
+
+    rows = collect(primary_xpath)
+    if len(rows) != pending:
+        if logger:
+            logger.debug(
+                "%s count %d != expected %d, retrying with fallback XPath",
+                label,
+                len(rows),
+                pending,
+            )
+        rows = collect(fallback_xpath)
+
+    if logger:
+        logger.info("当前共有 %d 个%s任务。", pending, label)
+    return rows
+
+
+def _extract_pid(href: str) -> str:
+    """从商品链接中提取纯数字商品 ID。"""
+    href = href.strip()
+    if "javascript" in href:
+        return href
+
+    path = urlsplit(href).path
+    name = path.rsplit("/", 1)[-1]
+    return name[:-5] if name.endswith(".html") else name
+
+
+def _parse_review_ids(href: str) -> tuple[str, str]:
+    """从追评链接中解析商品 ID 与订单 ID。"""
+    params = parse_qs(urlsplit(href).query)
+    pid = params.get("sku", [""])[0].strip()
+    oid = params.get("orderId", [""])[0].strip()
+    if not pid or not oid:
+        raise ValueError(f"无法从链接解析商品/订单 ID: {href}")
+    return pid, oid
+
+
+def _upload_comment_images(
+    pid: str,
+    headers: dict[str, Any],
+    logger: Any = None,
+) -> str:
+    """下载并重新上传商品晒图，返回京东图片 URL（最多两张）。"""
+    params = {"productId": pid, "isShadowSku": "0", "page": "1", "pageSize": "10"}
+    url = f"{IMAGE_LIST_URL}?{urlencode(params)}"
+
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        imgdata = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        if logger:
+            logger.warning("获取晒图数据失败: %s", exc)
+        return ""
+
+    if not isinstance(imgdata, dict):
+        if logger:
+            logger.warning("晒图接口返回了非预期格式")
+        return ""
+
+    img_list = (imgdata.get("imgComments") or {}).get("imgList") or []
+    if not img_list:
+        if logger:
+            logger.warning("这单没有图片数据，将不晒图")
+        return ""
+
+    session = requests.Session()
+    uploaded: list[str] = []
+    for index, item in enumerate(img_list[:2], start=1):
+        source_url = item.get("imageUrl", "") if isinstance(item, dict) else ""
+        if not source_url:
+            continue
+
+        if logger:
+            logger.info("imgurl%d url: %s", index, source_url)
+
+        filename = generate_unique_filename()
+        local_path = download_image(source_url, filename, logger=logger)
+        if not local_path:
+            continue
+
+        upload_response = upload_image(
+            filename,
+            local_path,
+            session,
+            headers,
+            logger=logger,
+        )
+        if (
+            upload_response is not None
+            and upload_response.status_code == 200
+            and ".jpg" in upload_response.text
+        ):
+            uploaded.append(f"{UPLOADED_IMAGE_BASE}{upload_response.text}")
+        elif logger:
+            logger.info("上传图片%d失败", index)
+
+    return ",".join(uploaded)
 
 
 def ordinary(
@@ -41,72 +186,18 @@ def ordinary(
     opts = opts or {}
     logger = opts.get("logger")
 
-    Order_data: list[Any] = []
-    req_et_list: list[Any] = []
-    imgCommentCount_bool = True
-    loop_times = N.get("待评价订单", 0) // 20
+    pending = N.get("待评价订单", 0)
+    Order_data = _fetch_order_rows(
+        sort=0,
+        pending=pending,
+        headers=headers,
+        opts=opts,
+        primary_xpath='//*[@id="main"]/div[2]/div[2]/table/tbody',
+        fallback_xpath='//*[@id="main"]/div[2]/div[2]/table',
+        label="评价",
+    )
 
     if logger:
-        logger.debug("Fetching website data")
-        logger.debug("Total loop times: %d", loop_times)
-
-    # 获取所有订单页面
-    for i in range(loop_times + 1):
-        url = f"https://club.jd.com/myJdcomments/myJdcomment.action?sort=0&page={i + 1}"
-        if logger:
-            logger.debug("URL: %s", url)
-
-        try:
-            req = requests.get(url, headers=headers, timeout=30)
-            req.raise_for_status()
-            if logger:
-                logger.debug("Successfully accepted the response with status code %d", req.status_code)
-        except requests.RequestException as e:
-            if logger:
-                logger.warning("Failed to fetch page %d: %s", i + 1, e)
-            continue
-
-        req_et_list.append(etree.HTML(req.text))
-        if logger:
-            logger.debug("Successfully parsed an XML tree")
-
-    # 提取订单数据
-    if logger:
-        logger.debug("Fetching data from XML trees")
-        logger.debug("Total loop times: %d", len(req_et_list))
-
-    for idx, html_tree in enumerate(req_et_list):
-        if logger:
-            logger.debug("Loop: %d / %d", idx + 1, len(req_et_list))
-            logger.debug("Fetching order data in the default XPath")
-
-        elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table/tbody')
-        if logger:
-            logger.debug("Count of fetched order data: %d", len(elems))
-        Order_data.extend(elems)
-
-    # 如果第一次提取失败，尝试备用XPath
-    if len(Order_data) != N.get("待评价订单", 0):
-        if logger:
-            logger.debug('Count of fetched order data doesn\'t equal N["待评价订单"]')
-            logger.debug("Clear the list Order_data")
-        Order_data = []
-
-        if logger:
-            logger.debug("Total loop times: %d", len(req_et_list))
-
-        for idx, html_tree in enumerate(req_et_list):
-            if logger:
-                logger.debug("Loop: %d / %d", idx + 1, len(req_et_list))
-                logger.debug("Fetching order data in another XPath")
-
-            elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table')
-            if logger:
-                logger.debug("Count of fetched order data: %d", len(elems))
-            Order_data.extend(elems)
-
-    if logger:
-        logger.info(f"当前共有{N.get('待评价订单', 0)}个评价。")
         logger.debug("Commenting on items")
 
     # 处理每个订单
@@ -134,7 +225,7 @@ def ordinary(
             if logger:
                 logger.debug("Loop: %d / %d", idx + 1, loop_times1)
 
-            pid = pid.replace("//item.jd.com/", "").replace(".html", "")
+            pid = _extract_pid(pid)
             if logger:
                 logger.debug("pid: %s", pid)
 
@@ -154,95 +245,15 @@ def ordinary(
             if logger:
                 logger.info(f"\t\t评价内容,星级{xing}：" + Str)
 
-            # 获取图片
+            # 获取并上传晒图
             if logger:
-                logger.info(f"\t\t开始获取图片")
-
-            img_url = f"https://club.jd.com/discussion/getProductPageImageCommentList.action?productId={pid}"
+                logger.info("\t\t开始获取图片")
+            imgurl = _upload_comment_images(pid, headers, logger)
             if logger:
-                logger.debug("URL: %s", img_url)
-
-            try:
-                img_resp = requests.get(img_url, headers=headers, timeout=30)
-                img_resp.raise_for_status()
-                if logger:
-                    logger.debug("Successfully accepted the response with status code %d", img_resp.status_code)
-            except requests.RequestException as e:
-                if logger:
-                    logger.warning("Failed to fetch images: %s", e)
-                imgCommentCount_bool = False
-                imgurl = ""
-            else:
-                if logger:
-                    logger.info("imgdata_url:" + img_url)
-
-                imgdata = img_resp.json()
-                if logger:
-                    logger.debug("Image data: %s", imgdata)
-
-                if imgdata["imgComments"]["imgCommentCount"] == 0:
-                    if logger:
-                        logger.warning("这单没有图片数据，所以直接默认五星好评！！")
-                    imgCommentCount_bool = False
-                    imgurl = ""
-                elif imgdata["imgComments"]["imgCommentCount"] > 0:
-                    imgList = imgdata["imgComments"]["imgList"]
-                    # 初始化上传后的URL变量（Bug 3修复）
-                    imgurl1t = ""
-                    imgurl2t = ""
-
-                    # 根据实际图片数量安全获取源URL（Bug 2修复）
-                    imgurl1 = imgList[0]["imageUrl"] if len(imgList) >= 1 else ""
-                    imgurl2 = imgList[1]["imageUrl"] if len(imgList) >= 2 else ""
-
-                    if logger:
-                        logger.info("imgurl1 url: %s", imgurl1)
-                        logger.info("imgurl2 url: %s", imgurl2)
-
-                    session = requests.Session()
-                    imgBasic = "//img20.360buyimg.com/shaidan/s645x515_"
-
-                    # 下载并上传第一张图片
-                    if imgurl1:
-                        imgName1 = generate_unique_filename()
-                        if logger:
-                            logger.debug(f"Image :{imgName1}")
-
-                        downloaded_file1 = download_image(imgurl1, imgName1)
-                        if downloaded_file1:
-                            imgPart1 = upload_image(imgName1, downloaded_file1, session, headers)
-                            if imgPart1 and imgPart1.status_code == 200 and ".jpg" in imgPart1.text:
-                                imgurl1t = f"{imgBasic}{imgPart1.text}"
-                            else:
-                                if logger:
-                                    logger.info("上传图片1失败")
-
-                    # 下载并上传第二张图片
-                    if imgurl2:
-                        imgName2 = generate_unique_filename()
-                        if logger:
-                            logger.debug(f"Image :{imgName2}")
-
-                        downloaded_file2 = download_image(imgurl2, imgName2)
-                        if downloaded_file2:
-                            imgPart2 = upload_image(imgName2, downloaded_file2, session, headers)
-                            if imgPart2 and imgPart2.status_code == 200 and ".jpg" in imgPart2.text:
-                                imgurl2t = f"{imgBasic}{imgPart2.text}"
-                            else:
-                                if logger:
-                                    logger.info("上传图片2失败")
-
-                    # 使用上传后的URL拼接imgurl，排除上传失败的图片（Bug 1修复）
-                    uploaded_urls = [u for u in [imgurl1t, imgurl2t] if u]
-                    imgurl = ",".join(uploaded_urls)
-                    if logger:
-                        logger.debug("Image URL: %s", imgurl)
-                        logger.info(f"\t\t图片url={imgurl}")
-                else:
-                    imgurl = ""
+                logger.info("\t\t图片url=%s", imgurl)
 
             # 准备评价数据
-            Str_encoded = urllib.parse.quote(Str, safe="/", encoding=None, errors=None)
+            Str_encoded = quote(Str, safe="/")
             Comment_data: dict[str, Any] = {
                 "orderId": oid,
                 "productId": pid,
@@ -252,7 +263,7 @@ def ordinary(
                 "anonymousFlag": "1",
             }
 
-            if imgCommentCount_bool and imgurl:
+            if imgurl:
                 Comment_data["imgs"] = imgurl
 
             if logger:
@@ -265,16 +276,16 @@ def ordinary(
 
                 try:
                     Comment_resp = requests.post(
-                        "https://club.jd.com/myJdcomments/saveProductComment.action",
+                        SAVE_COMMENT_URL,
                         headers=headers2,
                         data=Comment_data,
-                        timeout=30
+                        timeout=30,
                     )
                     if logger:
                         logger.info(
-                            "发送请求后的状态码:{},text:{}".format(
-                                Comment_resp.status_code, Comment_resp.text
-                            )
+                            "发送请求后的状态码:%d,text:%s",
+                            Comment_resp.status_code,
+                            Comment_resp.text,
                         )
 
                     if Comment_resp.status_code == 200 and Comment_resp.json().get("success"):
@@ -297,7 +308,8 @@ def ordinary(
                 logger.debug("Sleep time (s): %.1f", ORDINARY_SLEEP_SEC)
             time.sleep(ORDINARY_SLEEP_SEC)
 
-    N["待评价订单"] = max(0, N.get("待评价订单", 0) - 1)
+    if Order_data:
+        N["待评价订单"] = max(0, N.get("待评价订单", 0) - 1)
     return N
 
 
@@ -321,72 +333,18 @@ def review(
     opts = opts or {}
     logger = opts.get("logger")
 
-    req_et_list: list[Any] = []
-    Order_data: list[Any] = []
-    loop_times = N.get("待追评", 0) // 20
+    pending = N.get("待追评", 0)
+    Order_data = _fetch_order_rows(
+        sort=3,
+        pending=pending,
+        headers=headers,
+        opts=opts,
+        primary_xpath='//*[@id="main"]/div[2]/div[2]/table/tr[@class="tr-bd"]',
+        fallback_xpath='//*[@id="main"]/div[2]/div[2]/table/tbody/tr[@class="tr-bd"]',
+        label="追评",
+    )
 
     if logger:
-        logger.debug("Fetching website data")
-        logger.debug("Total loop times: %d", loop_times)
-
-    # 获取所有页面
-    for i in range(loop_times + 1):
-        if logger:
-            logger.debug("Loop: %d / %d", i + 1, loop_times)
-
-        url = f"https://club.jd.com/myJdcomments/myJdcomment.action?sort=3&page={i + 1}"
-        if logger:
-            logger.debug("URL: %s", url)
-
-        try:
-            req = requests.get(url, headers=headers, timeout=30)
-            req.raise_for_status()
-            if logger:
-                logger.debug("Successfully accepted the response with status code %d", req.status_code)
-        except requests.RequestException as e:
-            if logger:
-                logger.warning("Failed to fetch page %d: %s", i + 1, e)
-            continue
-
-        req_et_list.append(etree.HTML(req.text))
-        if logger:
-            logger.debug("Successfully parsed an XML tree")
-
-    # 提取订单数据
-    if logger:
-        logger.debug("Fetching data from XML trees")
-        logger.debug("Total loop times: %d", len(req_et_list))
-
-    for idx, html_tree in enumerate(req_et_list):
-        if logger:
-            logger.debug("Loop: %d / %d", idx + 1, len(req_et_list))
-            logger.debug("Fetching order data in the default XPath")
-
-        elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table/tr[@class="tr-bd"]')
-        if logger:
-            logger.debug("Count of fetched order data: %d", len(elems))
-        Order_data.extend(elems)
-
-    # 如果第一次提取失败，尝试备用XPath
-    if len(Order_data) != N.get("待追评", 0):
-        if logger:
-            logger.debug('Count of fetched order data doesn\'t equal N["待追评"]')
-
-        if logger:
-            logger.debug("Total loop times: %d", len(req_et_list))
-
-        for idx, html_tree in enumerate(req_et_list):
-            if logger:
-                logger.debug("Loop: %d / %d", idx + 1, len(req_et_list))
-                logger.debug("Fetching order data in another XPath")
-
-            elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table/tbody/tr[@class="tr-bd"]')
-            if logger:
-                logger.debug("Count of fetched order data: %d", len(elems))
-            Order_data.extend(elems)
-
-    if logger:
-        logger.info(f"当前共有 {N.get('待追评', 0)} 个需要追评。")
         logger.debug("Commenting on items")
 
     # 处理每个订单
@@ -403,14 +361,11 @@ def review(
             logger.info(f"\t开始追评第{i+1}，{oname}")
             logger.debug("_id: %s", _id)
 
-        url1 = "https://club.jd.com/afterComments/saveAfterCommentAndShowOrder.action"
         if logger:
-            logger.debug("URL: %s", url1)
+            logger.debug("URL: %s", SAVE_REVIEW_URL)
 
         try:
-            pid, oid = _id.replace(
-                "http://club.jd.com/afterComments/productPublish.action?sku=", ""
-            ).split("&orderId=")
+            pid, oid = _parse_review_ids(_id)
         except ValueError as e:
             if logger:
                 logger.error(f"Failed to parse product ID and order ID: {e}")
@@ -433,7 +388,7 @@ def review(
         if logger:
             logger.info(f"\t\t追评内容：{context}")
 
-        context_encoded = urllib.parse.quote(context, safe="/", encoding=None, errors=None)
+        context_encoded = quote(context, safe="/")
         data1: dict[str, Any] = {
             "orderId": oid,
             "productId": pid,
@@ -452,9 +407,18 @@ def review(
                 logger.debug("Sending comment request")
 
             try:
-                pj1 = requests.post(url1, headers=headers2, data=data1, timeout=30)
+                pj1 = requests.post(
+                    SAVE_REVIEW_URL,
+                    headers=headers2,
+                    data=data1,
+                    timeout=30,
+                )
                 if logger:
-                    logger.debug("发送请求后的状态码:{},text:{}".format(pj1.status_code, pj1.text))
+                    logger.debug(
+                        "发送请求后的状态码:%d,text:%s",
+                        pj1.status_code,
+                        pj1.text,
+                    )
             except requests.RequestException as e:
                 if logger:
                     logger.error(f"Failed to submit review: {e}")
@@ -490,74 +454,18 @@ def service_rating(
     opts = opts or {}
     logger = opts.get("logger")
 
-    Order_data: list[Any] = []
-    req_et_list: list[Any] = []
-    loop_times = N.get("服务评价", 0) // 20
+    pending = N.get("服务评价", 0)
+    Order_data = _fetch_order_rows(
+        sort=4,
+        pending=pending,
+        headers=headers,
+        opts=opts,
+        primary_xpath='//*[@id="main"]/div[2]/div[2]/table/tbody/tr[@class="tr-bd"]',
+        fallback_xpath='//*[@id="main"]/div[2]/div[2]/table/tr[@class="tr-bd"]',
+        label="服务评价",
+    )
 
     if logger:
-        logger.debug("Fetching website data")
-        logger.debug("Total loop times: %d", loop_times)
-
-    # 获取所有页面
-    for i in range(loop_times + 1):
-        if logger:
-            logger.debug("Loop: %d / %d", i + 1, loop_times)
-
-        url = f"https://club.jd.com/myJdcomments/myJdcomment.action?sort=4&page={i + 1}"
-        if logger:
-            logger.debug("URL: %s", url)
-
-        try:
-            req = requests.get(url, headers=headers, timeout=30)
-            req.raise_for_status()
-            if logger:
-                logger.debug("Successfully accepted the response with status code %d", req.status_code)
-        except requests.RequestException as e:
-            if logger:
-                logger.warning("Failed to fetch page %d: %s", i + 1, e)
-            continue
-
-        req_et_list.append(etree.HTML(req.text))
-        if logger:
-            logger.debug("Successfully parsed an XML tree")
-
-    # 提取订单数据
-    if logger:
-        logger.debug("Fetching data from XML trees")
-        logger.debug("Total loop times: %d", len(req_et_list))
-
-    for idx, html_tree in enumerate(req_et_list):
-        if logger:
-            logger.debug("Loop: %d / %d", idx + 1, len(req_et_list))
-            logger.debug("Fetching order data in the default XPath")
-
-        elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table/tbody/tr[@class="tr-bd"]')
-        if logger:
-            logger.debug("Count of fetched order data: %d", len(elems))
-        Order_data.extend(elems)
-
-    # 如果第一次提取失败，尝试备用XPath
-    if len(Order_data) != N.get("服务评价", 0):
-        if logger:
-            logger.debug('Count of fetched order data doesn\'t equal N["服务评价"]')
-            logger.debug("Clear the list Order_data")
-        Order_data = []
-
-        if logger:
-            logger.debug("Total loop times: %d", len(req_et_list))
-
-        for idx, html_tree in enumerate(req_et_list):
-            if logger:
-                logger.debug("Loop: %d / %d", idx + 1, len(req_et_list))
-                logger.debug("Fetching order data in another XPath")
-
-            elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table/tr[@class="tr-bd"]')
-            if logger:
-                logger.debug("Count of fetched order data: %d", len(elems))
-            Order_data.extend(elems)
-
-    if logger:
-        logger.info(f"当前共有{N.get('服务评价', 0)}个需要第一次服务评价。")
         logger.debug("Commenting on items")
 
     # 处理每个订单
@@ -574,7 +482,7 @@ def service_rating(
             logger.info(f"\t开始第一次评论，{i+1}，{oname}")
             logger.debug("oid: %s", oid)
 
-        url1 = f"https://club.jd.com/myJdcomments/insertRestSurvey.action?voteid=145&ruleid={oid}"
+        url1 = f"{SURVEY_URL}?voteid=145&ruleid={oid}"
         if logger:
             logger.debug("URL: %s", url1)
 
@@ -602,7 +510,7 @@ def service_rating(
             try:
                 pj1 = requests.post(url1, headers=headers, data=data1, timeout=30)
                 if logger:
-                    logger.info("\t\t " + pj1.text)
+                    logger.info("\t\t %s", pj1.text)
             except requests.RequestException as e:
                 if logger:
                     logger.error(f"Failed to submit service rating: {e}")

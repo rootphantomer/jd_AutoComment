@@ -33,6 +33,51 @@ from evaluator import get_evaluation_stats
 from handlers import ordinary, review, service_rating
 from logger import setup_logging
 
+PENDING_KEYS = ("待评价订单", "待追评", "服务评价")
+MAX_RETRIES = 3
+
+
+def _pending_items(N: dict[str, int]) -> dict[str, int]:
+    """只返回仍待处理的评价类型，避免把“已评价”等统计项当成任务。"""
+    return {key: N.get(key, 0) for key in PENDING_KEYS if N.get(key, 0)}
+
+
+def _run_pending_tasks(
+    N: dict[str, int],
+    headers: dict[str, Any],
+    headers2: dict[str, Any],
+    opts: dict[str, Any],
+) -> dict[str, int]:
+    """按固定顺序执行所有待处理任务，并在每类任务后刷新统计。"""
+    logger = opts.get("logger")
+    tasks = (
+        ("1.开始普通评价", "待评价订单", ordinary, (headers, headers2)),
+        (
+            "2.开始批量追评,注意：追评不会自动上传图片",
+            "待追评",
+            review,
+            (headers, headers2),
+        ),
+        ("3.开始服务评价", "服务评价", service_rating, (headers,)),
+    )
+
+    for label, key, handler, args in tasks:
+        if not N.get(key, 0):
+            continue
+
+        if logger:
+            logger.info(label)
+
+        N = handler(N, *args, opts)
+        if logger:
+            logger.debug("N value after executing %s(): %s", handler.__name__, N)
+
+        N = get_evaluation_stats(headers, opts)
+        if logger:
+            logger.debug("N value after refreshing stats: %s", N)
+
+    return N
+
 
 def main(opts: dict[str, Any], headers: dict[str, Any], headers2: dict[str, Any]) -> None:
     """主函数，执行所有评价流程。
@@ -59,87 +104,23 @@ def main(opts: dict[str, Any], headers: dict[str, Any], headers2: dict[str, Any]
     if logger:
         logger.info(f"已评价：{N.get('已评价', 0)}个")
 
-    # 普通评价
-    if N.get("待评价订单", 0) != 0:
-        if logger:
-            logger.info("1.开始普通评价")
-        N = ordinary(N, headers, headers2, opts)
-        if logger:
-            logger.debug("N value after executing ordinary(): %s", N)
-        N = get_evaluation_stats(headers, opts)
-        if logger:
-            logger.debug("N value after executing get_evaluation_stats(): %s", N)
+    N = _run_pending_tasks(N, headers, headers2, opts)
 
-    # 追评
-    if N.get("待追评", 0) != 0:
-        if logger:
-            logger.info("3.开始批量追评,注意：追评不会自动上传图片")
-        N = review(N, headers, headers2, opts)
-        if logger:
-            logger.debug("N value after executing review(): %s", N)
-        N = get_evaluation_stats(headers, opts)
-        if logger:
-            logger.debug("N value after executing get_evaluation_stats(): %s", N)
-
-    # 服务评价
-    if N.get("服务评价", 0) != 0:
-        if logger:
-            logger.info("4.开始服务评价")
-        N = service_rating(N, headers, opts)
-        if logger:
-            logger.debug("N value after executing service_rating(): %s", N)
-        N = get_evaluation_stats(headers, opts)
-        if logger:
-            logger.debug("N value after executing get_evaluation_stats(): %s", N)
-
-    if logger:
-        logger.info("全部完成啦！")
-
-    # 检查是否有未完成的评价，循环重试（Bug 5修复：递归改为while循环，最多3次）
-    max_retries = 3
-    for retry in range(max_retries):
-        has_pending = False
-        for key in N:
-            if N[key] != 0:
-                has_pending = True
-                break
-        if not has_pending:
+    for retry in range(1, MAX_RETRIES + 1):
+        pending = _pending_items(N)
+        if not pending:
             break
+
         if logger:
-            logger.warning("出现了二次错误，跳过了部分，重新尝试（第%d次）", retry + 1)
+            logger.warning("仍有未完成项 %s，重新尝试（第%d次）", pending, retry)
+        N = _run_pending_tasks(N, headers, headers2, opts)
 
-        # 普通评价
-        if N.get("待评价订单", 0) != 0:
-            if logger:
-                logger.info("1.开始普通评价")
-            N = ordinary(N, headers, headers2, opts)
-            if logger:
-                logger.debug("N value after executing ordinary(): %s", N)
-            N = get_evaluation_stats(headers, opts)
-            if logger:
-                logger.debug("N value after executing get_evaluation_stats(): %s", N)
-
-        # 追评
-        if N.get("待追评", 0) != 0:
-            if logger:
-                logger.info("3.开始批量追评,注意：追评不会自动上传图片")
-            N = review(N, headers, headers2, opts)
-            if logger:
-                logger.debug("N value after executing review(): %s", N)
-            N = get_evaluation_stats(headers, opts)
-            if logger:
-                logger.debug("N value after executing get_evaluation_stats(): %s", N)
-
-        # 服务评价
-        if N.get("服务评价", 0) != 0:
-            if logger:
-                logger.info("4.开始服务评价")
-            N = service_rating(N, headers, opts)
-            if logger:
-                logger.debug("N value after executing service_rating(): %s", N)
-            N = get_evaluation_stats(headers, opts)
-            if logger:
-                logger.debug("N value after executing get_evaluation_stats(): %s", N)
+    pending = _pending_items(N)
+    if pending:
+        if logger:
+            logger.warning("重试结束，仍有未完成项: %s", pending)
+    elif logger:
+        logger.info("全部完成啦！")
 
 
 if __name__ == "__main__":
@@ -153,26 +134,32 @@ if __name__ == "__main__":
     parser.add_argument(
         "-lv",
         "--log-level",
-        help="指定日志级别 (默认: INFO)",
+        help="指定日志级别 (默认: DEBUG)",
         default="DEBUG",
         choices=["DEBUG", "WARN", "INFO", "ERROR", "FATAL"],
     )
     parser.add_argument(
         "-o", "--log-file", help="指定日志文件路径（默认使用日期命名）", default=None
     )
+    parser.add_argument(
+        "--no-log-file",
+        help="不写入日志文件，仅输出到控制台",
+        action="store_true",
+    )
     args = parser.parse_args()
 
     # 规范化日志级别
     log_level = args.log_level.upper()
+    log_file: str | bool | None = False if args.no_log_file else args.log_file
 
     opts: dict[str, Any] = {
         "dry_run": args.dry_run,
         "log_level": log_level,
-        "log_file": args.log_file,
+        "log_file": log_file,
     }
 
     # 初始化日志系统
-    logger = setup_logging(log_level, log_file=args.log_file)
+    logger = setup_logging(log_level, log_file=log_file)
     opts["logger"] = logger
 
     # 将 jieba / jdspider 的 default_logger 指向 setup_logging 已配置的日志器
@@ -206,7 +193,7 @@ if __name__ == "__main__":
 
     # 设置Cookie并构建请求头
     ck = cfg["user"]["cookie"]
-    jdspider.cookie = ck.encode("utf-8")
+    jdspider.cookie = ck
     headers, headers2 = build_headers(ck)
 
     if logger:
@@ -216,7 +203,7 @@ if __name__ == "__main__":
     # 执行主流程
     try:
         main(opts, headers, headers2)
-    except RecursionError:
+    except KeyboardInterrupt:
         if logger:
-            logger.error("多次出现未完成情况，程序自动退出")
+            logger.warning("用户中断，程序退出")
         sys.exit(1)

@@ -6,12 +6,29 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
 from typing import Any
 
 import requests
+
+_logger = logging.getLogger("comment.image_utils")
+
+
+def _get_logger(logger: logging.Logger | None) -> logging.Logger:
+    return logger or _logger
+
+
+def _normalize_image_url(img_url: str) -> str:
+    """补全图片 URL 的协议头。"""
+    img_url = img_url.strip()
+    if img_url.startswith("//"):
+        return f"https:{img_url}"
+    if img_url.startswith(("http://", "https://")):
+        return img_url
+    return f"https://{img_url.lstrip('/')}"
 
 
 def generate_unique_filename() -> str:
@@ -28,7 +45,11 @@ def generate_unique_filename() -> str:
     return unique_filename
 
 
-def download_image(img_url: str, file_name: str) -> str | None:
+def download_image(
+    img_url: str,
+    file_name: str,
+    logger: logging.Logger | None = None,
+) -> str | None:
     """下载图片到本地 ``img/`` 目录。
 
     Args:
@@ -38,20 +59,29 @@ def download_image(img_url: str, file_name: str) -> str | None:
     Returns:
         保存后的本地文件路径；下载失败时返回 None。
     """
-    full_url = f"https:{img_url}"
+    log = _get_logger(logger)
+    full_url = _normalize_image_url(img_url)
     try:
         response = requests.get(full_url, timeout=30)
         response.raise_for_status()
     except requests.RequestException as e:
-        print(f"Failed to download image: {e}")
+        log.warning("下载图片失败: %s", e)
+        return None
+
+    if not response.content:
+        log.warning("图片内容为空: %s", full_url)
         return None
 
     directory = "img"
     os.makedirs(directory, exist_ok=True)
     file_path = os.path.join(directory, file_name)
 
-    with open(file_path, "wb") as file:
-        file.write(response.content)
+    try:
+        with open(file_path, "wb") as file:
+            file.write(response.content)
+    except OSError as e:
+        log.warning("保存图片失败: %s", e)
+        return None
 
     return file_path
 
@@ -61,6 +91,7 @@ def upload_image(
     file_path: str,
     session: requests.Session,
     headers: dict[str, Any],
+    logger: logging.Logger | None = None,
 ) -> requests.Response | None:
     """上传图片到京东接口。
 
@@ -73,30 +104,26 @@ def upload_image(
     Returns:
         上传成功的响应对象；上传失败时返回 None。
     """
-    files: dict[str, Any] | None = None
+    log = _get_logger(logger)
     try:
-        files = {
-            "name": (None, filename),
-            "Filedata": (file_path, open(file_path, "rb"), "image/jpeg"),
-        }
-
-        response = session.post(
-            "https://club.jd.com/myJdcomments/ajaxUploadImage.action",
-            headers=headers,
-            files=files,
-            timeout=30,
-        )
+        with open(file_path, "rb") as file:
+            files = {
+                "name": (None, filename),
+                "Filedata": (file_path, file, "image/jpeg"),
+            }
+            response = session.post(
+                "https://club.jd.com/myJdcomments/ajaxUploadImage.action",
+                headers=headers,
+                files=files,
+                timeout=30,
+            )
         return response
-    except requests.RequestException as e:
-        print(f"Failed to upload image: {e}")
+    except (OSError, requests.RequestException) as e:
+        log.warning("上传图片失败: %s", e)
         return None
-    finally:
-        # 确保文件被关闭
-        if files is not None:
-            files["Filedata"][1].close()
 
 
-def delete_jpg() -> None:
+def delete_jpg(logger: logging.Logger | None = None) -> None:
     """删除当前目录及 img 子目录下的所有 JPG 图片。"""
     current_directory = os.getcwd()
     for directory in [current_directory, os.path.join(current_directory, "img")]:
@@ -110,4 +137,4 @@ def delete_jpg() -> None:
                     if os.path.isfile(file_path):
                         os.remove(file_path)
         except OSError as e:
-            print(f"Error deleting jpg files in {directory}: {e}")
+            _get_logger(logger).warning("删除 %s 下的 JPG 失败: %s", directory, e)
